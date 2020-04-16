@@ -1,5 +1,27 @@
 package com.reactnativecommunity.webview;
 
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.charset.UnsupportedCharsetException;
+
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.OkHttpClient.Builder;
+import okhttp3.Request;
+import okhttp3.Response;
+import org.json.JSONException;
+import org.json.JSONObject;
+import java.net.HttpURLConnection;
+
+
+import static okhttp3.internal.Util.UTF_8;
+
+
+import android.util.Log;
 import android.annotation.SuppressLint;
 import android.annotation.TargetApi;
 import android.app.DownloadManager;
@@ -28,6 +50,8 @@ import android.webkit.GeolocationPermissions;
 import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.URLUtil;
+import android.webkit.ServiceWorkerController;
+import android.webkit.ServiceWorkerClient;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -41,15 +65,12 @@ import com.facebook.react.views.scroll.ScrollEvent;
 import com.facebook.react.views.scroll.ScrollEventType;
 import com.facebook.react.views.scroll.OnScrollDispatchHelper;
 import com.facebook.react.bridge.Arguments;
-import com.facebook.react.bridge.CatalystInstance;
 import com.facebook.react.bridge.LifecycleEventListener;
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.ReadableMapKeySetIterator;
 import com.facebook.react.bridge.WritableMap;
-import com.facebook.react.bridge.WritableNativeArray;
-import com.facebook.react.bridge.WritableNativeMap;
 import com.facebook.react.common.MapBuilder;
 import com.facebook.react.common.build.ReactBuildConfig;
 import com.facebook.react.module.annotations.ReactModule;
@@ -125,8 +146,10 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   public static final int COMMAND_CLEAR_HISTORY = 1002;
 
   protected static final String REACT_CLASS = "RNCWebView";
+  protected static final String HEADER_CONTENT_TYPE = "content-type";
   protected static final String HTML_ENCODING = "UTF-8";
   protected static final String HTML_MIME_TYPE = "text/html";
+  protected static final String UNKNOWN_MIME_TYPE = "application/octet-stream";
   protected static final String JAVASCRIPT_INTERFACE = "ReactNativeWebView";
   protected static final String HTTP_METHOD_POST = "POST";
   // Use `webView.loadUrl("about:blank")` to reliably reset the view
@@ -138,12 +161,22 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   protected boolean mAllowsFullscreenVideo = false;
   protected @Nullable String mUserAgent = null;
   protected @Nullable String mUserAgentWithApplicationName = null;
+  protected static String userAgent;
+
+  protected static OkHttpClient httpClient;
 
   public RNCWebViewManager() {
     mWebViewConfig = new WebViewConfig() {
       public void configWebView(WebView webView) {
       }
     };
+
+
+    httpClient = new Builder()
+      .followRedirects(false)
+      .followSslRedirects(false)
+      .build();
+
   }
 
   public RNCWebViewManager(WebViewConfig webViewConfig) {
@@ -170,6 +203,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   @TargetApi(Build.VERSION_CODES.LOLLIPOP)
   protected WebView createViewInstance(ThemedReactContext reactContext) {
     RNCWebView webView = createRNCWebViewInstance(reactContext);
+    userAgent = webView.getSettings().getUserAgentString();
     setupWebChromeClient(reactContext, webView);
     reactContext.addLifecycleEventListener(webView);
     mWebViewConfig.configWebView(webView);
@@ -197,8 +231,6 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
     webView.setDownloadListener(new DownloadListener() {
       public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimetype, long contentLength) {
-        webView.setIgnoreErrFailedForThisURL(url);
-
         RNCWebViewModule module = getModule(reactContext);
 
         DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
@@ -213,6 +245,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
           String baseUrl = urlObj.getProtocol() + "://" + urlObj.getHost();
           String cookie = CookieManager.getInstance().getCookie(baseUrl);
           request.addRequestHeader("Cookie", cookie);
+          System.out.println("Got cookie for DownloadManager: " + cookie);
         } catch (MalformedURLException e) {
           System.out.println("Error getting cookie for DownloadManager: " + e.toString());
           e.printStackTrace();
@@ -234,7 +267,100 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
       }
     });
 
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        ServiceWorkerController swController = ServiceWorkerController.getInstance();
+        swController.setServiceWorkerClient(new ServiceWorkerClient() {
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+                Log.d(REACT_CLASS, "shouldInterceptRequest / ServiceWorkerClient");
+                WebResourceResponse response = RNCWebViewManager.this.shouldInterceptRequest(request, false, webView);
+                if (response != null) {
+                    Log.d(REACT_CLASS, "shouldInterceptRequest / ServiceWorkerClient -> return intersept response");
+                    return response;
+                }
+
+                Log.d(REACT_CLASS, "shouldInterceptRequest / ServiceWorkerClient -> intercept response is nil, delegating up");
+                return super.shouldInterceptRequest(request);
+            }
+        });
+    }
+
     return webView;
+  }
+
+  private Boolean urlStringLooksInvalid(String urlString) {
+      return urlString == null ||
+             urlString.trim().equals("") ||
+             !(urlString.startsWith("http") && !urlString.startsWith("www")) ||
+             urlString.contains("|");
+  }
+
+  private Boolean responseRequiresJSInjection(Response response) {
+      // we don't want to inject JS into redirects
+      if (response.isRedirect()) {
+          return false;
+      }
+
+      // ...okhttp appends charset to content type sometimes, like "text/html; charset=UTF8"
+      final String contentTypeAndCharset = response.header(HEADER_CONTENT_TYPE, UNKNOWN_MIME_TYPE);
+      // ...and we only want to inject it in to HTML, really
+      return contentTypeAndCharset.startsWith(HTML_MIME_TYPE);
+  }
+
+
+  public WebResourceResponse shouldInterceptRequest(WebResourceRequest request, Boolean onlyMainFrame, RNCWebView webView) {
+        Uri url = request.getUrl();
+        String urlStr = url.toString();
+
+        Log.i("StatusNativeLogs", "###shouldInterceptRequest 1");
+        Log.d(REACT_CLASS, "new request ");
+        Log.d(REACT_CLASS, "url " + urlStr);
+        Log.d(REACT_CLASS, "host " + request.getUrl().getHost());
+        Log.d(REACT_CLASS, "path " + request.getUrl().getPath());
+        Log.d(REACT_CLASS, "main " + request.isForMainFrame());
+        Log.d(REACT_CLASS, "headers " + request.getRequestHeaders().toString());
+        Log.d(REACT_CLASS, "method " + request.getMethod());
+
+        Log.i("StatusNativeLogs", "###shouldInterceptRequest 2");
+         if (onlyMainFrame && !request.isForMainFrame() || 
+             urlStringLooksInvalid(urlStr)) {
+            return null;//super.shouldInterceptRequest(webView, request);
+        }
+
+        Log.i("StatusNativeLogs", "###shouldInterceptRequest 3");
+        try {
+            Log.i("StatusNativeLogs", "###shouldInterceptRequest 4");
+            Request req = new Request.Builder()
+                    .url(urlStr)
+                    .header("User-Agent", userAgent)
+                    .build();
+
+            Log.i("StatusNativeLogs", "### httpCall " + new Boolean(httpClient != null).toString());
+            Response response = httpClient.newCall(req).execute();
+
+            Log.d(REACT_CLASS, "response headers " + response.headers().toString());
+            Log.d(REACT_CLASS, "response code " + response.code());
+            Log.d(REACT_CLASS, "response suc " + response.isSuccessful());
+
+            if (!responseRequiresJSInjection(response)) {
+              return null;
+            }
+
+            InputStream is = response.body().byteStream();
+            MediaType contentType = response.body().contentType();
+            Charset charset = contentType != null ? contentType.charset(UTF_8) : UTF_8;
+
+            RNCWebView reactWebView = (RNCWebView) webView;
+            if (response.code() == HttpURLConnection.HTTP_OK) {
+                is = new InputStreamWithInjectedJS(is, reactWebView.injectedJSBeforeContentLoaded, charset);
+            }
+
+            Log.d(REACT_CLASS, "inject our custom JS to this request");
+            return new WebResourceResponse("text/html", charset.name(), is);
+        } catch (IOException e) {
+            return null;
+        }
   }
 
   @ReactProp(name = "javaScriptEnabled")
@@ -395,6 +521,11 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   public void setInjectedJavaScript(WebView view, @Nullable String injectedJavaScript) {
     ((RNCWebView) view).setInjectedJavaScript(injectedJavaScript);
   }
+
+   @ReactProp(name = "injectedJavaScriptBeforeContentLoaded")
+   public void setInjectedJavaScriptBeforeContentLoaded(WebView view, @Nullable String injectedJavaScriptBeforeContentLoaded) {
+     ((RNCWebView) view).setInjectedJavaScriptBeforeContentLoaded(injectedJavaScriptBeforeContentLoaded);
+   }
 
   @ReactProp(name = "messagingEnabled")
   public void setMessagingEnabled(WebView view, boolean enabled) {
@@ -718,16 +849,97 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
     }
   }
 
-  protected static class RNCWebViewClient extends WebViewClient {
+  public static class InputStreamWithInjectedJS extends InputStream {
+    private InputStream pageIS;
+    private InputStream scriptIS;
+    private Charset charset;
+    private static final String REACT_CLASS = "InputStreamWithInjectedJS";
+    private static Map<Charset, String> script = new HashMap<>();
 
+    private boolean hasJS = false;
+    private boolean headWasFound = false;
+    private boolean scriptWasInjected = false;
+    private StringBuffer contentBuffer = new StringBuffer();
+
+    private static Charset getCharset(String charsetName) {
+        Charset cs = StandardCharsets.UTF_8;
+        try {
+            if (charsetName != null) {
+                cs = Charset.forName(charsetName);
+            }
+        } catch (UnsupportedCharsetException e) {
+            Log.d(REACT_CLASS, "wrong charset: " + charsetName);
+        }
+
+        return cs;
+    }
+
+    private static InputStream getScript(Charset charset) {
+        String js = script.get(charset);
+        if (js == null) {
+            String defaultJs = script.get(StandardCharsets.UTF_8);
+            js = new String(defaultJs.getBytes(StandardCharsets.UTF_8), charset);
+            script.put(charset, js);
+        }
+
+        return new ByteArrayInputStream(js.getBytes(charset));
+    }
+
+    InputStreamWithInjectedJS(InputStream is, String js, Charset charset) {
+        if (js == null) {
+            this.pageIS = is;
+        } else {
+            this.hasJS = true;
+            this.charset = charset;
+            Charset cs = StandardCharsets.UTF_8;
+            String jsScript = "<script>" + js + "</script>";
+            script.put(cs, jsScript);
+            this.pageIS = is;
+        }
+    }
+
+    @Override
+    public int read() throws IOException {
+        if (scriptWasInjected || !hasJS) {
+            return pageIS.read();
+        }
+
+        if (!scriptWasInjected && headWasFound) {
+            int nextByte = scriptIS.read();
+            if (nextByte == -1) {
+                scriptIS.close();
+                scriptWasInjected = true;
+                return pageIS.read();
+            } else {
+                return nextByte;
+            }
+        }
+
+        if (!headWasFound) {
+            int nextByte = pageIS.read();
+            contentBuffer.append((char) nextByte);
+            int bufferLength = contentBuffer.length();
+            if (nextByte == 62 && bufferLength >= 6) {
+                if (contentBuffer.substring(bufferLength - 6).equals("<head>")) {
+                    this.scriptIS = getScript(this.charset);
+                    headWasFound = true;
+                }
+            }
+
+            return nextByte;
+        }
+
+        return pageIS.read();
+    }
+
+  }
+
+  protected class RNCWebViewClient extends WebViewClient {
+    protected static final String REACT_CLASS = "RNCWebViewClient";
     protected boolean mLastLoadFailed = false;
     protected @Nullable
     ReadableArray mUrlPrefixesForDefaultIntent;
-    protected @Nullable String ignoreErrFailedForThisURL = null;
 
-    public void setIgnoreErrFailedForThisURL(@Nullable String url) {
-      ignoreErrFailedForThisURL = url;
-    }
 
     @Override
     public void onPageFinished(WebView webView, String url) {
@@ -754,6 +966,48 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
           createWebViewEvent(webView, url)));
     }
 
+
+    @Override
+    public WebResourceResponse shouldInterceptRequest(WebView webView, WebResourceRequest request) {
+        Log.d(REACT_CLASS, "shouldInterceptRequest / WebViewClient");
+        WebResourceResponse response = RNCWebViewManager.this.shouldInterceptRequest(request, true, (RNCWebView)webView);
+        if (response != null) {
+            Log.d(REACT_CLASS, "shouldInterceptRequest / WebViewClient -> return intercept response");
+            return response;
+        }
+
+        Log.d(REACT_CLASS, "shouldInterceptRequest / WebViewClient -> intercept response is nil, delegating up");
+        return super.shouldInterceptRequest(webView, request);
+
+    }
+
+    @Override
+    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+        if (request == null || view == null) {
+            return false;
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+
+            /*
+             * In order to follow redirects properly, we return null in interceptRequest().
+             * Doing this breaks the web3 injection on the resulting page, so we have to reload to
+             * make sure web3 is available.
+             * */
+
+            if (request.isForMainFrame() && request.isRedirect()) {
+                view.loadUrl(request.getUrl().toString());
+                return true;
+            }
+        }
+
+        /*
+         * API < 24: TODO: implement based on https://github.com/toshiapp/toshi-android-client/blob/f4840d3d24ff60223662eddddceca8586a1be8bb/app/src/main/java/com/toshi/view/activity/webView/ToshiWebClient.kt#L99
+         * */
+        final String url = request.getUrl().toString();
+        return this.shouldOverrideUrlLoading(view, url);
+    }
+
     @Override
     public boolean shouldOverrideUrlLoading(WebView view, String url) {
       activeUrl = url;
@@ -766,34 +1020,12 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
     }
 
 
-    @TargetApi(Build.VERSION_CODES.N)
-    @Override
-    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-      final String url = request.getUrl().toString();
-      return this.shouldOverrideUrlLoading(view, url);
-    }
-
     @Override
     public void onReceivedError(
       WebView webView,
       int errorCode,
       String description,
       String failingUrl) {
-
-      if (ignoreErrFailedForThisURL != null
-          && failingUrl.equals(ignoreErrFailedForThisURL)
-          && errorCode == -1
-          && description.equals("net::ERR_FAILED")) {
-
-        // This is a workaround for a bug in the WebView.
-        // See these chromium issues for more context:
-        // https://bugs.chromium.org/p/chromium/issues/detail?id=1023678
-        // https://bugs.chromium.org/p/chromium/issues/detail?id=1050635
-        // This entire commit should be reverted once this bug is resolved in chromium.
-        setIgnoreErrFailedForThisURL(null);
-        return;
-      }
-
       super.onReceivedError(webView, errorCode, description, failingUrl);
       mLastLoadFailed = true;
 
@@ -881,6 +1113,9 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
     @Override
     public boolean onConsoleMessage(ConsoleMessage message) {
+      Log.i("StatusNativeLogs", "###js " + message.message() + " -- From line "
+                       + message.lineNumber() + " of "
+                       + message.sourceId());
       if (ReactBuildConfig.DEBUG) {
         return super.onConsoleMessage(message);
       }
@@ -1000,6 +1235,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   protected static class RNCWebView extends WebView implements LifecycleEventListener {
     protected @Nullable
     String injectedJS;
+    protected @Nullable String injectedJSBeforeContentLoaded;
     protected boolean messagingEnabled = false;
     protected @Nullable
     String messagingModuleName;
@@ -1019,10 +1255,6 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
      */
     public RNCWebView(ThemedReactContext reactContext) {
       super(reactContext);
-    }
-
-    public void setIgnoreErrFailedForThisURL(String url) {
-      mRNCWebViewClient.setIgnoreErrFailedForThisURL(url);
     }
 
     public void setSendContentSizeChangeEvents(boolean sendContentSizeChangeEvents) {
@@ -1079,6 +1311,10 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
     public void setInjectedJavaScript(@Nullable String js) {
       injectedJS = js;
+    }
+
+    public void setInjectedJavaScriptBeforeContentLoaded(@Nullable String js) {
+       injectedJSBeforeContentLoaded = js;
     }
 
     protected RNCWebViewBridge createRNCWebViewBridge(RNCWebView webView) {
