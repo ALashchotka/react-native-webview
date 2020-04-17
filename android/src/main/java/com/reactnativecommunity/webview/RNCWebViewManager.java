@@ -2,6 +2,8 @@ package com.reactnativecommunity.webview;
 
 
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.Charset;
@@ -271,7 +273,6 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
       }
     });
 
-
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
         ServiceWorkerController swController = ServiceWorkerController.getInstance();
         swController.setServiceWorkerClient(new ServiceWorkerClient() {
@@ -279,6 +280,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
             public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
                 Log.d(REACT_CLASS, "shouldInterceptRequest / ServiceWorkerClient");
                 WebResourceResponse response = RNCWebViewManager.this.shouldInterceptRequest(request, false, webView);
+
                 if (response != null) {
                     Log.d(REACT_CLASS, "shouldInterceptRequest / ServiceWorkerClient -> return intersept response");
                     return response;
@@ -296,7 +298,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
   private Boolean urlStringLooksInvalid(String urlString) {
       return urlString == null ||
              urlString.trim().equals("") ||
-             !(urlString.startsWith("http") && !urlString.startsWith("www")) ||
+             !(urlString.startsWith("http") || urlString.startsWith("www") || urlString.startsWith("file://")) ||
              urlString.contains("|");
   }
 
@@ -334,30 +336,38 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
 
         Log.i("StatusNativeLogs", "###shouldInterceptRequest 3");
         try {
-            Log.i("StatusNativeLogs", "###shouldInterceptRequest 4");
-            Request req = new Request.Builder()
-                    .url(urlStr)
-                    .header("User-Agent", userAgent)
-                    .build();
-
-            Log.i("StatusNativeLogs", "### httpCall " + new Boolean(httpClient != null).toString());
-            Response response = httpClient.newCall(req).execute();
-
-            Log.d(REACT_CLASS, "response headers " + response.headers().toString());
-            Log.d(REACT_CLASS, "response code " + response.code());
-            Log.d(REACT_CLASS, "response suc " + response.isSuccessful());
-
-            if (!responseRequiresJSInjection(response)) {
-              return null;
-            }
-
-            InputStream is = response.body().byteStream();
-            MediaType contentType = response.body().contentType();
-            Charset charset = contentType != null ? contentType.charset(UTF_8) : UTF_8;
-
+            Charset charset = UTF_8;
+            InputStream is = null;
             RNCWebView reactWebView = (RNCWebView) webView;
-            if (response.code() == HttpURLConnection.HTTP_OK) {
+
+            if (urlStr.startsWith("file://")) {
+              File initialFile = new File(request.getUrl().getPath());
+              InputStream fileInputStream = new FileInputStream(initialFile);
+              is = new InputStreamWithInjectedJS(fileInputStream, reactWebView.injectedJSBeforeContentLoaded, charset);
+            } else {
+              Log.i("StatusNativeLogs", "###shouldInterceptRequest 4");
+              Request req = new Request.Builder()
+                .url(urlStr)
+                .header("User-Agent", userAgent)
+                .build();
+
+              Log.i("StatusNativeLogs", "### httpCall " + new Boolean(httpClient != null).toString());
+              Response response = httpClient.newCall(req).execute();
+
+              Log.d(REACT_CLASS, "response headers " + response.headers().toString());
+              Log.d(REACT_CLASS, "response code " + response.code());
+              Log.d(REACT_CLASS, "response suc " + response.isSuccessful());
+
+              if (!responseRequiresJSInjection(response)) {
+                return null;
+              }
+
+              is = response.body().byteStream();
+              MediaType contentType = response.body().contentType();
+
+              if (response.code() == HttpURLConnection.HTTP_OK) {
                 is = new InputStreamWithInjectedJS(is, reactWebView.injectedJSBeforeContentLoaded, charset);
+              }
             }
 
             Log.d(REACT_CLASS, "inject our custom JS to this request");
