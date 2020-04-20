@@ -363,7 +363,6 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
               }
 
               is = response.body().byteStream();
-              MediaType contentType = response.body().contentType();
 
               if (response.code() == HttpURLConnection.HTTP_OK) {
                 is = new InputStreamWithInjectedJS(is, reactWebView.injectedJSBeforeContentLoaded, charset);
@@ -371,6 +370,7 @@ public class RNCWebViewManager extends SimpleViewManager<WebView> {
             }
 
             Log.d(REACT_CLASS, "inject our custom JS to this request");
+
             return new WebResourceResponse("text/html", charset.name(), is);
         } catch (IOException e) {
             return null;
